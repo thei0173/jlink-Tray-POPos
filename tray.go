@@ -27,6 +27,11 @@ var (
 	// lastIcon avoids re-sending an identical icon on every menu rebuild.
 	lastIcon color.RGBA
 	iconSet  bool
+
+	// lastMenuSig is a fingerprint of everything the menu displays. The
+	// pairing-list poller signals a rebuild every second; rebuilding an
+	// identical menu would visibly flicker while it's open, so skip those.
+	lastMenuSig string
 )
 
 // uiState is the tray-only state: what the user is currently waiting on.
@@ -190,6 +195,13 @@ func rebuildMenu() {
 
 	snap, ok := snapshotDongle()
 	busy, searching, message := ui.snapshot()
+
+	sig := fmt.Sprintf("%v|%+v|%q|%v|%q|%+v", ok, snap, busy, searching, message, snapshotSearchResults())
+	if sig == lastMenuSig {
+		return
+	}
+	lastMenuSig = sig
+
 	systray.ResetMenu()
 
 	if !ok {
