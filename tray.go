@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"image/color"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -11,7 +12,6 @@ import (
 
 const (
 	searchPollInterval = time.Second
-	searchExtraPolls   = 3 // polls after the SDK scan returns, to catch late results
 	connectTimeout     = 12 * time.Second
 	pairTimeout        = 20 * time.Second
 	messageTTL         = 15 * time.Second
@@ -28,32 +28,28 @@ var (
 	lastIcon color.RGBA
 	iconSet  bool
 
-	// lastMenuSig is a fingerprint of everything the menu displays. The
-	// pairing-list poller signals a rebuild every second; rebuilding an
-	// identical menu would visibly flicker while it's open, so skip those.
+	// lastMenuSig is a fingerprint of everything the menu displays. Rebuilding
+	// an identical menu would visibly flicker while it's open, so skip those.
 	lastMenuSig string
 )
 
 // uiState is the tray-only state: what the user is currently waiting on.
-// Device state itself lives in jabraApi.go behind stateMu.
+// Device state itself lives in the model, fed by the Jabridge service.
 type uiState struct {
-	mu           sync.Mutex
-	busy         string // e.g. "Connecting to X…"; non-empty while an action is in flight
-	searching    bool
-	cancelSearch chan struct{}
-	message      string // last error/notice, shown briefly
-	messageAt    time.Time
+	mu        sync.Mutex
+	busy      string // e.g. "Connecting to X…"; non-empty while an action is in flight
+	message   string // last error/notice, shown briefly
+	messageAt time.Time
+	dismissed string // search session whose results the user has dismissed
 }
 
-func (u *uiState) snapshot() (busy string, searching bool, message string) {
+func (u *uiState) snapshot() (busy, message, dismissed string) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	message = u.message
-	if message != "" && time.Since(u.messageAt) > messageTTL {
+	if u.message != "" && time.Since(u.messageAt) > messageTTL {
 		u.message = ""
-		message = ""
 	}
-	return u.busy, u.searching, message
+	return u.busy, u.message, u.dismissed
 }
 
 func (u *uiState) setMessage(m string) {
@@ -63,12 +59,19 @@ func (u *uiState) setMessage(m string) {
 	u.mu.Unlock()
 }
 
+func (u *uiState) dismiss(session string) {
+	u.mu.Lock()
+	u.dismissed = session
+	u.mu.Unlock()
+}
+
 // begin marks the tray busy with msg. It fails if something else is already
-// in flight, so overlapping clicks can't start conflicting SDK operations.
+// in flight, so overlapping clicks can't start conflicting operations.
 func (u *uiState) begin(msg string) bool {
+	searching := currentSnapshot().search.active()
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.busy != "" || u.searching {
+	if u.busy != "" || searching {
 		return false
 	}
 	u.busy = msg
@@ -85,15 +88,22 @@ func (u *uiState) end() {
 
 func onTrayReady() {
 	systray.SetTooltip("jLink - Jabra Device Manager")
-
 	rebuildMenu()
+	startBackground()
 
-	// Rebuild on every state-change signal, coalescing bursts so a flurry of
-	// updates (e.g. attach + first pairing-list poll) only triggers one
-	// native menu rebuild instead of several.
+	// If the Jabridge service isn't up yet (e.g. first login after install),
+	// try to start it once rather than making the user do it.
+	go func() {
+		if call("service.ping", nil, nil) != nil {
+			_ = exec.Command("jabridge", "service", "start").Run()
+			refresh()
+		}
+	}()
+
+	// Rebuild on every state-change signal, coalescing bursts.
 	go func() {
 		for range stateChangeCh {
-			time.Sleep(300 * time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
 			drainPending(stateChangeCh)
 			rebuildMenu()
 		}
@@ -112,54 +122,18 @@ func drainPending(ch chan struct{}) {
 
 func onTrayExit() {}
 
-// dongleSnapshot is a point-in-time, lock-free copy of the state needed to
-// render the menu.
-type dongleSnapshot struct {
-	name   string
-	paired []pairedDevice
-}
-
-func snapshotDongle() (dongleSnapshot, bool) {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-
-	dongle, exists := deviceManager[selectedDongle]
-	if !exists {
-		return dongleSnapshot{}, false
-	}
-
-	snap := dongleSnapshot{name: dongle.deviceName}
-	if dongle.pairingList != nil {
-		snap.paired = append(snap.paired, dongle.pairingList.pairedDevices...)
-	}
-	return snap, true
-}
-
-func snapshotSearchResults() []pairedDevice {
-	stateMu.Lock()
-	defer stateMu.Unlock()
-	return append([]pairedDevice(nil), searchDeviceList.pairedDevices...)
-}
-
-func clearSearchResults() {
-	stateMu.Lock()
-	searchDeviceList.count = 0
-	searchDeviceList.pairedDevices = nil
-	stateMu.Unlock()
-}
-
 func connectedDevice(paired []pairedDevice) (pairedDevice, bool) {
 	for _, d := range paired {
-		if d.isConnected {
+		if d.Connected {
 			return d, true
 		}
 	}
 	return pairedDevice{}, false
 }
 
-func isPaired(paired []pairedDevice, addr [6]byte) bool {
+func isPaired(paired []pairedDevice, name string) bool {
 	for _, d := range paired {
-		if d.deviceBTAddr == addr {
+		if d.Name == name {
 			return true
 		}
 	}
@@ -168,15 +142,15 @@ func isPaired(paired []pairedDevice, addr [6]byte) bool {
 
 // statusLine is the one-line "what is happening right now" shown at the top
 // of the menu and in the tooltip.
-func statusLine(snap dongleSnapshot, busy string, searching bool) string {
+func statusLine(snap snapshot, busy string) string {
 	switch {
 	case busy != "":
 		return "⏳ " + busy
-	case searching:
+	case snap.search.active():
 		return "🔍 Searching for new devices…"
 	}
 	if d, ok := connectedDevice(snap.paired); ok {
-		return "● Connected to " + d.deviceName
+		return "● Connected to " + d.Name
 	}
 	return "○ Not connected"
 }
@@ -193,10 +167,10 @@ func rebuildMenu() {
 	menuMu.Lock()
 	defer menuMu.Unlock()
 
-	snap, ok := snapshotDongle()
-	busy, searching, message := ui.snapshot()
+	snap := currentSnapshot()
+	busy, message, dismissed := ui.snapshot()
 
-	sig := fmt.Sprintf("%v|%+v|%q|%v|%q|%+v", ok, snap, busy, searching, message, snapshotSearchResults())
+	sig := fmt.Sprintf("%+v|%q|%q|%q", snap, busy, message, dismissed)
 	if sig == lastMenuSig {
 		return
 	}
@@ -204,57 +178,54 @@ func rebuildMenu() {
 
 	systray.ResetMenu()
 
-	if !ok {
+	if !snap.serviceUp || !snap.hasDongle {
 		setIcon(iconIdle)
-		systray.SetTooltip("No Jabra dongle detected")
-		item := systray.AddMenuItem("No Jabra dongle detected", "Plug in your Jabra dongle")
-		item.Disable()
+		if !snap.serviceUp {
+			addServiceDownItems(message)
+		} else {
+			systray.SetTooltip("No Jabra dongle detected")
+			systray.AddMenuItem("No Jabra dongle detected", "Plug in your Jabra dongle").Disable()
+		}
 		systray.AddSeparator()
 		addQuitItem()
 		return
 	}
 
-	status := statusLine(snap, busy, searching)
-	systray.SetTooltip(snap.name + " — " + status)
+	status := statusLine(snap, busy)
+	systray.SetTooltip(snap.dongle + " — " + status)
+	_, connected := connectedDevice(snap.paired)
 	switch {
-	case busy != "" || searching:
+	case busy != "" || snap.search.active():
 		setIcon(iconBusy)
+	case connected:
+		setIcon(iconConnected)
 	default:
-		if _, connected := connectedDevice(snap.paired); connected {
-			setIcon(iconConnected)
-		} else {
-			setIcon(iconIdle)
-		}
+		setIcon(iconIdle)
 	}
 
 	// --- Header: which dongle, and what it's doing right now ---
-	header := systray.AddMenuItem(snap.name, "")
-	header.Disable()
-	statusItem := systray.AddMenuItem(status, "")
-	statusItem.Disable()
+	systray.AddMenuItem(snap.dongle, "").Disable()
+	systray.AddMenuItem(status, "").Disable()
 	if message != "" {
-		msg := systray.AddMenuItem(message, "")
-		msg.Disable()
+		systray.AddMenuItem(message, "").Disable()
 	}
 	systray.AddSeparator()
 
 	// --- Paired devices: click to connect / switch / disconnect ---
-	locked := busy != "" || searching
-	title := systray.AddMenuItem("Paired devices — click to connect", "")
-	title.Disable()
+	locked := busy != "" || snap.search.active()
+	systray.AddMenuItem("Paired devices — click to connect", "").Disable()
 	if len(snap.paired) == 0 {
-		none := systray.AddMenuItem("   None yet — search below to pair one", "")
-		none.Disable()
+		systray.AddMenuItem("   None yet — search below to pair one", "").Disable()
 	}
-	for i, dev := range snap.paired {
-		addPairedDeviceItem(i, dev, locked)
+	for _, dev := range snap.paired {
+		addPairedDeviceItem(dev, locked)
 	}
 	systray.AddSeparator()
 
 	// --- Pair a new device ---
-	title = systray.AddMenuItem("Pair a new device", "")
-	title.Disable()
-	if searching {
+	systray.AddMenuItem("Pair a new device", "").Disable()
+	showResults := snap.search.Session != dismissed
+	if snap.search.active() {
 		stop := systray.AddMenuItem("   Stop searching", "Leave pairing mode")
 		go func() {
 			for range stop.ClickedCh {
@@ -263,7 +234,7 @@ func rebuildMenu() {
 		}()
 	} else {
 		label := "   Search for new devices (~20 s)"
-		if len(snapshotSearchResults()) > 0 {
+		if showResults && len(snap.search.Devices) > 0 {
 			label = "   Search again"
 		}
 		search := systray.AddMenuItem(label, "Put the dongle into pairing mode and scan")
@@ -273,37 +244,38 @@ func rebuildMenu() {
 		go func() {
 			// for range (not a single receive): the item's ClickedCh is
 			// closed, not sent-to, whenever this menu is torn down by the
-			// next rebuild. Ranging only runs the body for a real click;
-			// a close alone just ends the loop.
+			// next rebuild. Ranging only runs the body for a real click.
 			for range search.ClickedCh {
 				startSearch()
 			}
 		}()
 	}
 
-	found := snapshotSearchResults()
 	shown := 0
-	for i, dev := range found {
-		if isPaired(snap.paired, dev.deviceBTAddr) {
-			continue // already known; it's in the list above
+	if showResults {
+		for _, dev := range snap.search.Devices {
+			if isPaired(snap.paired, dev.Name) {
+				continue // already known; it's in the list above
+			}
+			if shown == 0 {
+				systray.AddMenuItem("   Found nearby — click to pair:", "").Disable()
+			}
+			shown++
+			addFoundDeviceItem(snap.search.Session, dev, busy != "")
 		}
-		if shown == 0 {
-			hdr := systray.AddMenuItem("   Found nearby — click to pair:", "")
-			hdr.Disable()
-		}
-		shown++
-		addFoundDeviceItem(i, dev, busy != "")
 	}
-	if searching && shown == 0 {
-		wait := systray.AddMenuItem("   Nothing found yet — put your device in pairing mode", "")
-		wait.Disable()
+	if snap.search.active() && shown == 0 {
+		systray.AddMenuItem("   Nothing found yet — put your device in pairing mode", "").Disable()
 	}
-	if !searching && shown > 0 {
-		clearItem := systray.AddMenuItem("   Clear results", "Dismiss the list and leave pairing mode")
+	if snap.search.State == "failed" && snap.search.Error != "" && showResults {
+		systray.AddMenuItem("   ⚠ Search failed: "+snap.search.Error, "").Disable()
+	}
+	if !snap.search.active() && shown > 0 {
+		clearItem := systray.AddMenuItem("   Clear results", "Dismiss the list")
+		session := snap.search.Session
 		go func() {
 			for range clearItem.ClickedCh {
-				clearSearchResults()
-				_ = setDongleInBTPairing(false)
+				ui.dismiss(session)
 				notifyStateChanged()
 			}
 		}()
@@ -311,6 +283,24 @@ func rebuildMenu() {
 
 	systray.AddSeparator()
 	addQuitItem()
+}
+
+func addServiceDownItems(message string) {
+	systray.SetTooltip("Jabridge service isn't running")
+	systray.AddMenuItem("Jabridge service isn't running", "").Disable()
+	if message != "" {
+		systray.AddMenuItem(message, "").Disable()
+	}
+	start := systray.AddMenuItem("   Start Jabridge service", "Runs: jabridge service start")
+	go func() {
+		for range start.ClickedCh {
+			if out, err := exec.Command("jabridge", "service", "start").CombinedOutput(); err != nil {
+				ui.setMessage(fmt.Sprintf("⚠ Couldn't start Jabridge — is it installed? (%v) %s", err, out))
+				notifyStateChanged()
+			}
+			refresh()
+		}
+	}()
 }
 
 func addQuitItem() {
@@ -324,61 +314,60 @@ func addQuitItem() {
 	}()
 }
 
-func addPairedDeviceItem(index int, dev pairedDevice, locked bool) {
-	label := "   " + dev.deviceName
-	tooltip := "Connect to " + dev.deviceName
-	if dev.isConnected {
+func addPairedDeviceItem(dev pairedDevice, locked bool) {
+	label := "   " + dev.Name
+	tooltip := "Connect to " + dev.Name
+	if dev.Connected {
 		label += " — connected"
-		tooltip = "Disconnect from " + dev.deviceName
+		tooltip = "Disconnect from " + dev.Name
 	}
-	item := systray.AddMenuItemCheckbox(label, tooltip, dev.isConnected)
+	item := systray.AddMenuItemCheckbox(label, tooltip, dev.Connected)
 	if locked {
 		item.Disable()
 	}
 	go func() {
 		for range item.ClickedCh {
-			if dev.isConnected {
-				disconnectFrom(dev, index)
+			if dev.Connected {
+				disconnectFrom(dev)
 			} else {
-				switchTo(dev, index)
+				switchTo(dev)
 			}
 		}
 	}()
 }
 
-func addFoundDeviceItem(index int, dev pairedDevice, locked bool) {
-	item := systray.AddMenuItem("   "+dev.deviceName, "Pair and connect to "+dev.deviceName)
+func addFoundDeviceItem(session string, dev pairedDevice, locked bool) {
+	item := systray.AddMenuItem("   "+dev.Name, "Pair and connect to "+dev.Name)
 	if locked {
 		item.Disable()
 	}
 	go func() {
 		for range item.ClickedCh {
-			pairWith(dev, index)
+			pairWith(session, dev)
 		}
 	}()
 }
 
-// waitForConnection polls the (1s-refreshed) pairing list until the device
-// with the given address reports connected, or the timeout passes.
-func waitForConnection(addr [6]byte, timeout time.Duration) bool {
+// waitForConnection polls the service until the named device reports
+// connected, or the timeout passes.
+func waitForConnection(name string, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if snap, ok := snapshotDongle(); ok {
-			for _, d := range snap.paired {
-				if d.deviceBTAddr == addr && d.isConnected {
-					return true
-				}
+		refresh()
+		for _, d := range currentSnapshot().paired {
+			if d.Name == name && d.Connected {
+				return true
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(time.Second)
 	}
 	return false
 }
 
-// switchTo makes dev the dongle's active connection. The SDK requires any
-// currently connected device to be disconnected first, so do that.
-func switchTo(dev pairedDevice, index int) {
-	if !ui.begin("Connecting to " + dev.deviceName + "…") {
+// switchTo makes dev the dongle's active connection, disconnecting any
+// currently connected device first.
+func switchTo(dev pairedDevice) {
+	if !ui.begin("Connecting to " + dev.Name + "…") {
 		return
 	}
 	notifyStateChanged()
@@ -386,145 +375,98 @@ func switchTo(dev pairedDevice, index int) {
 	go func() {
 		defer ui.end()
 
-		if snap, ok := snapshotDongle(); ok {
-			disconnected := false
-			for i, d := range snap.paired {
-				if i != index && d.isConnected {
-					if err := disconnectDeviceFromPairedlist(uint16(i)); err != nil {
-						fmt.Println("jlink-tray: disconnect failed:", err)
-					} else {
-						disconnected = true
-					}
+		disconnected := false
+		for _, d := range currentSnapshot().paired {
+			if d.ID != dev.ID && d.Connected {
+				if err := call("bt.disconnect", map[string]int{"index": d.ID}, nil); err != nil {
+					fmt.Println("jlink-tray: disconnect failed:", err)
+				} else {
+					disconnected = true
 				}
 			}
-			if disconnected {
-				time.Sleep(time.Second) // let the dongle settle
-			}
+		}
+		if disconnected {
+			time.Sleep(time.Second) // let the dongle settle
 		}
 
-		if err := connectDeviceFromPairedlist(uint16(index)); err != nil {
-			ui.setMessage(fmt.Sprintf("⚠ Couldn't connect to %s: %v", dev.deviceName, err))
+		if err := call("bt.connect", map[string]int{"index": dev.ID}, nil); err != nil {
+			ui.setMessage(fmt.Sprintf("⚠ Couldn't connect to %s: %v", dev.Name, err))
 			return
 		}
-		if !waitForConnection(dev.deviceBTAddr, connectTimeout) {
-			ui.setMessage(fmt.Sprintf("⚠ %s didn't respond — is it switched on and in range?", dev.deviceName))
+		if !waitForConnection(dev.Name, connectTimeout) {
+			ui.setMessage(fmt.Sprintf("⚠ %s didn't respond — is it switched on and in range?", dev.Name))
 		}
 	}()
 }
 
-func disconnectFrom(dev pairedDevice, index int) {
-	if !ui.begin("Disconnecting from " + dev.deviceName + "…") {
+func disconnectFrom(dev pairedDevice) {
+	if !ui.begin("Disconnecting from " + dev.Name + "…") {
 		return
 	}
 	notifyStateChanged()
 
 	go func() {
 		defer ui.end()
-		if err := disconnectDeviceFromPairedlist(uint16(index)); err != nil {
-			ui.setMessage(fmt.Sprintf("⚠ Couldn't disconnect %s: %v", dev.deviceName, err))
+		if err := call("bt.disconnect", map[string]int{"index": dev.ID}, nil); err != nil {
+			ui.setMessage(fmt.Sprintf("⚠ Couldn't disconnect %s: %v", dev.Name, err))
 			return
 		}
 		time.Sleep(time.Second)
+		refresh()
 	}()
 }
 
-// pairWith pairs and connects a device found by a search.
-func pairWith(dev pairedDevice, index int) {
-	if !ui.begin("Pairing with " + dev.deviceName + "…") {
+// pairWith pairs and connects a device found by the current search.
+func pairWith(session string, dev pairedDevice) {
+	if !ui.begin("Pairing with " + dev.Name + "…") {
 		return
 	}
 	notifyStateChanged()
 
 	go func() {
 		defer ui.end()
-		if err := connectNewDevice(uint16(index)); err != nil {
-			ui.setMessage(fmt.Sprintf("⚠ Couldn't pair with %s: %v", dev.deviceName, err))
+		params := map[string]any{"index": dev.ID, "session": session}
+		if err := call("bt.search.connect", params, nil); err != nil {
+			ui.setMessage(fmt.Sprintf("⚠ Couldn't pair with %s: %v", dev.Name, err))
 			return
 		}
-		clearSearchResults()
-		if !waitForConnection(dev.deviceBTAddr, pairTimeout) {
-			ui.setMessage(fmt.Sprintf("⚠ Paired with %s, but it hasn't connected yet", dev.deviceName))
+		ui.dismiss(session)
+		if !waitForConnection(dev.Name, pairTimeout) {
+			ui.setMessage(fmt.Sprintf("⚠ Paired with %s, but it hasn't connected yet", dev.Name))
 		}
 	}()
 }
 
-// stopSearch cancels a running search and takes the dongle out of pairing mode.
 func stopSearch() {
-	ui.mu.Lock()
-	cancel := ui.cancelSearch
-	ui.cancelSearch = nil
-	ui.mu.Unlock()
-	if cancel != nil {
-		close(cancel)
+	if err := call("bt.search.stop", nil, nil); err != nil {
+		ui.setMessage("⚠ Couldn't stop the search: " + err.Error())
 	}
+	refresh()
 }
 
-// startSearch puts the dongle into pairing mode and scans for nearby
-// devices, publishing results to the menu as they appear.
+// startSearch asks the service to scan for nearby devices, then polls its
+// status so results show up in the menu as they're found.
 func startSearch() {
-	ui.mu.Lock()
-	if ui.busy != "" || ui.searching {
-		ui.mu.Unlock()
+	if !ui.begin("Starting search…") {
 		return
 	}
-	ui.searching = true
-	ui.message = ""
-	cancel := make(chan struct{})
-	ui.cancelSearch = cancel
-	ui.mu.Unlock()
-
-	clearSearchResults()
 	notifyStateChanged()
+	err := call("bt.search", nil, nil)
+	if err != nil {
+		ui.setMessage("⚠ Couldn't start the search: " + err.Error())
+	}
+	ui.end()
+	if err != nil {
+		return
+	}
+	refresh()
 
 	go func() {
-		defer func() {
-			ui.mu.Lock()
-			ui.searching = false
-			ui.cancelSearch = nil
-			ui.mu.Unlock()
-			notifyStateChanged()
-		}()
-
-		// The SDK scan blocks for ~20s, so run it aside and poll for
-		// results meanwhile, letting devices show up as they're found.
-		scanDone := make(chan error, 1)
-		go func() { scanDone <- searchForNewDevices() }()
-
-		deviceID, ok := dongleDeviceID()
-		if !ok {
-			return
-		}
-
-		finished := false
-		extraPolls := searchExtraPolls
-		for {
-			if result := getSearchDeviceList(deviceID); result != nil {
-				stateMu.Lock()
-				searchDeviceList.count = result.count
-				searchDeviceList.listType = result.listType
-				searchDeviceList.pairedDevices = result.pairedDevices
-				stateMu.Unlock()
-				notifyStateChanged()
-			}
-			if finished {
-				if extraPolls--; extraPolls < 0 {
-					return
-				}
-			}
-
-			select {
-			case <-cancel:
-				_ = setDongleInBTPairing(false)
-				clearSearchResults()
+		for i := 0; i < 60; i++ { // hard cap; a scan is ~20 s
+			time.Sleep(searchPollInterval)
+			refresh()
+			if !currentSnapshot().search.active() {
 				return
-			case err := <-scanDone:
-				scanDone = nil // a nil channel blocks forever: only handle this once
-				finished = true
-				if err != nil {
-					ui.setMessage("⚠ Search failed: " + err.Error())
-					return
-				}
-			case <-time.After(searchPollInterval):
 			}
 		}
 	}()

@@ -2,7 +2,7 @@
 Type=Application
 Name=jLink Tray
 Comment=Switch Jabra Bluetooth device connections from the panel tray
-Exec=/usr/local/bin/jlink-tray
+Exec=@BIN@
 Icon=audio-headset
 Terminal=false
 Categories=Utility;
